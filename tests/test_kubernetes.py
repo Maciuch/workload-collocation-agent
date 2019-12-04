@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import pytest
+import requests
 from unittest.mock import patch
 
 from wca.config import ValidationError
 from wca.kubernetes import KubernetesNode, KubernetesTask, _calculate_pod_resources, \
     _build_cgroup_path, are_all_tasks_of_single_qos, QOS_LABELNAME
+from wca.nodes import TaskSynchronizationException
 from tests.testing import create_json_fixture_mock
 
 
@@ -29,7 +31,9 @@ def ktask(name, qos):
               qos=qos,
               labels={'exampleKey': 'value', QOS_LABELNAME: qos},
               resources={'requests_cpu': 0.25,
-                         'requests_memory': float(64*1024**2)},
+                         'requests_memory': float(64*1024**2),
+                         'cpus': 0.25,
+                         'mem': float(64 * 1024 ** 2)},
               cgroup_path='/kubepods/{}/pod{}'.format(qos, name),
               subcgroups_paths=['/kubepods/{}/pod{}/t1'.format(qos, name),
                                 '/kubepods/{}/pod{}/t2'.format(qos, name)])
@@ -39,12 +43,15 @@ def ktask(name, qos):
 def test_get_tasks(get_mock):
 
     expected_tasks = [KubernetesTask(
-                          name='test',
+                          name='default/test',
                           task_id='4d6a81df-3448-11e9-8e1d-246e96663c22',
                           qos='burstable',
-                          labels={'exampleKey': 'value', QOS_LABELNAME: 'burstable'},
+                          labels={'exampleKey': 'value',
+                                  QOS_LABELNAME: 'burstable'},
                           resources={'requests_cpu': 0.25,
-                                     'requests_memory': float(64*1024**2)},
+                                     'requests_memory': float(64*1024**2),
+                                     'cpus': 0.25,
+                                     'mem': float(64 * 1024 ** 2)},
                           cgroup_path='/kubepods/burstable/pod4d6a81df'
                                       '-3448-11e9-8e1d-246e96663c22',
                           subcgroups_paths=['/kubepods/burstable/pod4d'
@@ -53,7 +60,7 @@ def test_get_tasks(get_mock):
                                             'fc034ea8898b19faa0e27c7b2'
                                             '0b8eb254fda361cceacf8e90']),
                       KubernetesTask(
-                          name='test2',
+                          name='default/test2',
                           task_id='567975a0-3448-11e9-8e1d-246e96663c22',
                           qos='besteffort',
                           labels={QOS_LABELNAME: 'besteffort'},
@@ -105,7 +112,9 @@ def test_calculate_resources_with_requests_and_limits():
     assert {'limits_cpu': 0.25,
             'limits_memory': float(64*1024**2),
             'requests_cpu': 0.25,
-            'requests_memory': float(64*1024**2)
+            'requests_memory': float(64*1024**2),
+            'cpus': 0.25,
+            'mem': float(64*1024**2)
             } == _calculate_pod_resources(container_spec)
 
 
@@ -115,24 +124,47 @@ def test_calculate_resources_multiple_containers():
         {'resources': {'requests': {'cpu': '100m', 'memory': '32Mi'}}}
     ]
     assert {'requests_cpu': 0.35, 'requests_memory':
-            float(67108864 + 32 * 1024 ** 2)} == _calculate_pod_resources(container_spec)
+            float(67108864 + 32 * 1024 ** 2),
+            'cpus': 0.35,
+            'mem': float(67108864 + 32 * 1024 ** 2)
+            } == _calculate_pod_resources(container_spec)
 
 
 _POD_ID = '12345-67890'
+_STATIC_POD_ID = '09876-54321'
+_CUTTED_STATIC_POD_ID = '0987654321'
+_CONTAINER_ID = '123456'
 
 
 @pytest.mark.parametrize('qos, expected_cgroup_path', (
-        ('burstable',  '/kubepods.slice/kubepods-burstable.slice/'
-                       'kubepods-burstable-pod12345-67890.slice'),
+        ('burstable', '/kubepods.slice/kubepods-burstable.slice/'
+                      'kubepods-burstable-pod12345_67890.slice'),
         ('guaranteed', '/kubepods.slice/kubepods-guaranteed.slice/'
-                       'kubepods-guaranteed-pod12345-67890.slice'),
+                       'kubepods-guaranteed-pod12345_67890.slice'),
         ('besteffort', '/kubepods.slice/kubepods-besteffort.slice/'
-                       'kubepods-besteffort-pod12345-67890.slice'),
-    )
+                       'kubepods-besteffort-pod12345_67890.slice'),
 )
+                         )
 def test_find_cgroup_path_for_pod_systemd(qos, expected_cgroup_path):
     assert expected_cgroup_path == _build_cgroup_path(cgroup_driver='systemd',
                                                       qos=qos, pod_id=_POD_ID)
+
+@pytest.mark.parametrize('qos, expected_cgroup_path', (
+        ('burstable', '/kubepods.slice/kubepods-burstable.slice/'
+                      'kubepods-burstable-pod12345_67890.slice/'
+                      'docker-123456.scope'),
+        ('guaranteed', '/kubepods.slice/kubepods-guaranteed.slice/'
+                       'kubepods-guaranteed-pod12345_67890.slice/'
+                       'docker-123456.scope'),
+        ('besteffort', '/kubepods.slice/kubepods-besteffort.slice/'
+                       'kubepods-besteffort-pod12345_67890.slice/'
+                       'docker-123456.scope'),
+)
+                         )
+def test_find_cgroup_path_for_pod_systemd_with_container_id(qos, expected_cgroup_path):
+    assert expected_cgroup_path == _build_cgroup_path(cgroup_driver='systemd',
+                                                      qos=qos, pod_id=_POD_ID,
+                                                      container_id=_CONTAINER_ID)
 
 
 @pytest.mark.parametrize('qos, expected_cgroup_path', (
@@ -153,3 +185,10 @@ def test_find_cgroup_path_pod_cgroupfs(qos, expected_cgroup_path):
 ))
 def test_are_all_tasks_of_single_qos(tasks, expected_result):
     assert are_all_tasks_of_single_qos(tasks) == expected_result
+
+
+@patch('requests.post', side_effect=requests.exceptions.ConnectionError())
+def test_get_tasks_synchronization_error(request):
+    node = KubernetesNode()
+    with pytest.raises(TaskSynchronizationException):
+        node.get_tasks()

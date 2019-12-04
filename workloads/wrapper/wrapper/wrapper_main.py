@@ -14,7 +14,7 @@
 
 
 import argparse
-import ast
+import json
 import logging
 import subprocess
 import shlex
@@ -67,7 +67,7 @@ def main(parse: ParseFunc = default_parse):
                                         )
     input = workload_process.stderr if args.stderr else workload_process.stdout
 
-    labels = ast.literal_eval(args.labels)
+    labels = json.loads(args.labels)
     parse = partial(parse, regexp=args.regexp, separator=args.separator, labels=labels,
                     input=input, metric_name_prefix=args.metric_name_prefix)
     append_service_level_metrics_func = partial(
@@ -77,13 +77,13 @@ def main(parse: ParseFunc = default_parse):
     kafka_brokers_addresses = args.kafka_brokers.replace(" ", "").split(',')
     if kafka_brokers_addresses != [""]:
         log.info("KafkaStorage {}".format(kafka_brokers_addresses))
-        kafka_storage = KafkaStorage(brokers_ips=kafka_brokers_addresses,
-                                     max_timeout_in_seconds=5.0,
-                                     topic=args.kafka_topic)
+        storage = KafkaStorage(brokers_ips=kafka_brokers_addresses,
+                               max_timeout_in_seconds=5.0,
+                               topic=args.kafka_topic)
     else:
-        kafka_storage = LogStorage(args.storage_output_filename)
+        storage = LogStorage(args.storage_output_filename)
 
-    t = threading.Thread(target=parse_loop, args=(parse, kafka_storage,
+    t = threading.Thread(target=parse_loop, args=(parse, storage,
                                                   append_service_level_metrics_func))
     t.start()
     t.join()

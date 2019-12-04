@@ -14,7 +14,7 @@
 
 import os
 import math
-from common import cpu, command, image_name, image_tag, \
+from common import cpu, command, image_name, image_tag, cpu_list, \
     initContainers, json, securityContext, pod, wrapper_kafka_brokers, \
     wrapper_log_level, wrapper_kafka_topic, wrapper_labels, slo, volumeMounts
 
@@ -80,13 +80,13 @@ controller_cmd = """{wrapper} --command '{command}' --stderr 0 \
                              --kafka_brokers {brokers} --log_level DEBUG \
                              --kafka_topic {kafka_topic} --log_level DEBUG \
                              --metric_name_prefix 'specjbb_' \
-                             --labels \"{labels}\" \
+                             --labels '{labels}' \
                              --peak_load \"{peak_load}\" --load_metric_name \
                               \"const\" --slo {slo} --sli_metric_name \
                               specjbb_p99_total_purchase""".format(
     wrapper=specjbb_wrapper, command=controller_cmd,
     brokers=wrapper_kafka_brokers, log=wrapper_log_level,
-    kafka_topic=wrapper_kafka_topic, labels=wrapper_labels,
+    kafka_topic=wrapper_kafka_topic, labels=json.dumps(wrapper_labels),
     peak_load=qps, slo=slo)
 
 # @TODO we should set max RAM assigned to JVM, but if set the job fails to run.
@@ -94,9 +94,10 @@ injector_cmd = """java -jar {jar} -m txinjector -p {config} -G GRP1 -J JVM_B"""\
     .format(jar=specjbb_jar, config=config_path)
 
 backend_cmd = """
+    /usr/bin/taskset -c {cpu_list} \
     java -Xms4g -Xmx4g -Xmn2g -XX:-UseBiasedLocking -XX:+UseParallelOldGC \
     -jar {jar} -m backend -p {config} -G GRP1 -J JVM_A"""\
-    .format(jar=specjbb_jar, config=config_path)
+    .format(cpu_list=cpu_list, jar=specjbb_jar, config=config_path)
 
 volume_prep_config = {
     "name": "shared-data",

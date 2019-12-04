@@ -17,7 +17,8 @@ from typing import Dict, Callable, Any, List, Optional
 
 from wca import nodes, storage, platforms
 from wca import resctrl
-from wca.allocations import AllocationsDict, InvalidAllocations, AllocationValue
+from wca.allocations import AllocationsDict, InvalidAllocations, AllocationValue, \
+    MissingAllocationException
 from wca.allocators import TasksAllocations, AllocationConfiguration, AllocationType, Allocator, \
     TaskAllocations, RDTAllocation
 from wca.cgroups_allocations import QuotaAllocationValue, SharesAllocationValue, \
@@ -30,10 +31,10 @@ from wca.kubernetes import have_tasks_qos_label, are_all_tasks_of_single_qos
 from wca.metrics import Metric, MetricType
 from wca.nodes import Task
 from wca.resctrl_allocations import (RDTAllocationValue, RDTGroups,
-                                     validate_mb_string,
+                                     normalize_mb_string,
                                      validate_l3_string)
 from wca.runners.detection import AnomalyStatistics
-from wca.runners.measurement import MeasurementRunner
+from wca.runners.measurement import MeasurementRunner, TaskLabelGenerator, DEFAULT_EVENTS
 from wca.storage import MetricPackage, DEFAULT_STORAGE
 
 log = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ class TasksAllocationsValues(AllocationsDict):
             else:
                 container = task_id_to_containers[task_id]
                 # Check consistency of container with RDT state.
-                assert (container._rdt_information is not None) == rdt_enabled
+                assert (container._platform.rdt_information is not None) == rdt_enabled
                 extra_labels = dict(container_name=container.get_name(), task=task_id)
                 extra_labels.update(task_id_to_labels[task_id])
                 allocation_value = TaskAllocationsValues.create(
@@ -187,6 +188,7 @@ class AllocationRunner(MeasurementRunner):
             (defaults to instructions, cycles, cache-misses, memstalls)
         enable_derived_metrics: enable derived metrics ips, ipc and cache_hit_ratio
             (based on enabled_event names), default to False
+        task_label_generators: component to generate additional labels for tasks
     """
 
     def __init__(
@@ -203,15 +205,17 @@ class AllocationRunner(MeasurementRunner):
             extra_labels: Dict[Str, Str] = None,
             allocation_configuration: Optional[AllocationConfiguration] = None,
             remove_all_resctrl_groups: bool = False,
-            event_names: Optional[List[str]] = None,
+            event_names: Optional[List[str]] = DEFAULT_EVENTS,
             enable_derived_metrics: bool = False,
+            task_label_generators: Dict[str, TaskLabelGenerator] = None,
     ):
 
         self._allocation_configuration = allocation_configuration or AllocationConfiguration()
 
         super().__init__(node, metrics_storage, action_delay, rdt_enabled,
                          extra_labels, _allocation_configuration=self._allocation_configuration,
-                         event_names=event_names, enable_derived_metrics=enable_derived_metrics)
+                         event_names=event_names, enable_derived_metrics=enable_derived_metrics,
+                         task_label_generators=task_label_generators)
 
         # Allocation specific.
         self._allocator = allocator
@@ -270,10 +274,16 @@ class AllocationRunner(MeasurementRunner):
                                    platform.rdt_information.min_cbm_bits)
 
             if root_rdt_mb is not None:
-                validate_mb_string(root_rdt_mb, platform.sockets,
-                                   platform.rdt_information.mb_min_bandwidth)
-
-            resctrl.cleanup_resctrl(root_rdt_l3, root_rdt_mb, self._remove_all_resctrl_groups)
+                normalized_root_rdt_mb = normalize_mb_string(
+                        root_rdt_mb,
+                        platform.sockets,
+                        platform.rdt_information.mb_min_bandwidth,
+                        platform.rdt_information.mb_bandwidth_gran)
+                resctrl.cleanup_resctrl(
+                        root_rdt_l3, normalized_root_rdt_mb, self._remove_all_resctrl_groups)
+            else:
+                resctrl.cleanup_resctrl(
+                        root_rdt_l3, root_rdt_mb, self._remove_all_resctrl_groups)
         except InvalidAllocations as e:
             log.error('Cannot initialize RDT subsystem: %s', e)
             return False
@@ -320,10 +330,9 @@ class AllocationRunner(MeasurementRunner):
             new_allocations_values.validate()
 
             # Calculate changeset and target_allocations.
-            if new_allocations_values is not None:
-                target_allocations_values, allocations_changeset_values = \
-                    new_allocations_values.calculate_changeset(current_allocations_values)
-                target_allocations_values.validate()
+            target_allocations_values, allocations_changeset_values = \
+                new_allocations_values.calculate_changeset(current_allocations_values)
+            target_allocations_values.validate()
 
             self._allocations_counter += len(new_allocations)
 
@@ -373,7 +382,14 @@ class AllocationRunner(MeasurementRunner):
 def _get_tasks_allocations(containers) -> TasksAllocations:
     tasks_allocations: TasksAllocations = {}
     for task, container in containers.items():
-        task_allocations = container.get_allocations()
+        try:
+            task_allocations = container.get_allocations()
+        except MissingAllocationException as e:
+            log.warning('One or more allocations are missing for '
+                        'container {} - ignoring! '
+                        '(because {})'.format(container, e))
+            continue
+
         tasks_allocations[task.task_id] = task_allocations
     return tasks_allocations
 

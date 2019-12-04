@@ -16,10 +16,17 @@
 import ctypes
 import logging
 import os
+import socket
+import ssl
+from kazoo.handlers.threading import SequentialThreadingHandler
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 from dataclasses import dataclass
 from typing import Optional, Union
 from wca import logger
 from wca.config import ValidationError, Path
+from wca.security_kazoo import create_tcp_connection
+
 
 LIBC = ctypes.CDLL('libc.so.6', use_errno=True)
 
@@ -65,7 +72,7 @@ class GettingCapabilitiesFailed(Exception):
     pass
 
 
-def are_privileges_sufficient(rdt_enabled) -> bool:
+def are_privileges_sufficient() -> bool:
     uid = os.geteuid()
     paranoid = _read_paranoid()
     capabilities = _get_capabilities()
@@ -74,10 +81,10 @@ def are_privileges_sufficient(rdt_enabled) -> bool:
     has_cap_dac_override = capabilities.effective & CAP_DAC_OVERRIDE == CAP_DAC_OVERRIDE
     has_cap_setuid = capabilities.effective & CAP_SETUID == CAP_SETUID
     log.debug("Determining privileges necessary to call run WCA - uid: {}, paranoid: {}, "
-              "CAP_DAC_OVERRIDE: {}".format(uid, paranoid, has_cap_dac_override))
+              "CAP_DAC_OVERRIDE: {}, CAP_SETUID: {}".format(uid, paranoid, has_cap_dac_override,
+                                                            has_cap_setuid))
     return uid == GLOBAL_ROOT_UID or \
-        paranoid <= ALLOW_CPU_EVENTS and (rdt_enabled is False or
-                                          (has_cap_dac_override and has_cap_setuid))
+        paranoid <= ALLOW_CPU_EVENTS and has_cap_dac_override and has_cap_setuid
 
 
 def _get_capabilities():
@@ -119,21 +126,10 @@ class SSL:
     client_key_path: Optional[Path(absolute=True, mode=os.R_OK)] = None
 
     def __post_init__(self):
-
-        if self.client_cert_path:
-            client_cert_filename = os.path.basename(self.client_cert_path)
-            client_cert_extension = os.path.splitext(client_cert_filename)[1]
-
-            if client_cert_extension == '.pem':
-                # .pem file consists both client cert and key data so ignore client_key_path.
-                return
-            else:
-                if not self.client_key_path:
-                    raise ValidationError(
-                        'Client certiticate provided but without client private key!')
-        elif self.client_key_path:
+        if self.client_key_path and not self.client_cert_path:
             # There is only client key path, that is wrong, throw error.
-            raise ValidationError('Client private key provided but without certificate path!')
+            raise ValidationError(
+                    'Provided client key without certificate!')
 
     def get_client_certs(self):
         """Return client cert and key path.
@@ -144,3 +140,56 @@ class SSL:
 
         # Otherwise return None or path to .pem file which consists client cert and key.
         return self.client_cert_path
+
+
+SECURE_CIPHERS = ':'.join([
+    #   Commented algorithms are not supported in Centos7
+    'ECDHE-ECDSA-AES128-GCM-SHA256',
+    'ECDHE-RSA-AES128-GCM-SHA256',
+    'DHE-RSA-AES128-GCM-SHA256',
+    'AES128-GCM-SHA256',
+    #   'ECDHE-ECDSA-AES128-CCM',
+    'ECDHE-ECDSA-AES128-SHA256',
+    'ECDHE-RSA-AES128-SHA256',
+    #   'ECDHE-ECDSA-AES256-CCM',
+    #   'AES128-CCM',
+    'AES128-SHA256',
+    #   'AES256-CCM',
+    'AES256-SHA256',
+    #   'DHE-RSA-AES128-CCM',
+    'DHE-RSA-AES128-SHA256',
+    #   'DHE-RSA-AES256-CCM',
+    'DHE-RSA-AES256-SHA256',
+    'DHE-DSS-AES128-GCM-SHA256',
+    'DHE-DSS-AES128-SHA256',
+    'DHE-DSS-AES256-SHA256',
+    #   '@SECLEVEL=2',
+    ])
+
+# Disable unsecure protocols.
+SECURE_OPTIONS = 0
+SECURE_OPTIONS |= ssl.OP_NO_SSLv2
+SECURE_OPTIONS |= ssl.OP_NO_SSLv3
+SECURE_OPTIONS |= ssl.OP_NO_TLSv1
+SECURE_OPTIONS |= ssl.OP_NO_TLSv1_1
+SECURE_OPTIONS |= ssl.OP_NO_COMPRESSION
+
+
+class HTTPSAdapter(HTTPAdapter):
+    """The HTTPs Adapter for urllib3. Provides better security.
+    """
+    def init_poolmanager(self, *args, **kwargs):
+        ssl_context = create_urllib3_context(options=SECURE_OPTIONS, ciphers=SECURE_CIPHERS)
+        kwargs['ssl_context'] = ssl_context
+        return super(HTTPSAdapter, self).init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        ssl_context = create_urllib3_context(options=SECURE_OPTIONS, ciphers=SECURE_CIPHERS)
+        kwargs['ssl_context'] = ssl_context
+        return super(HTTPSAdapter, self).proxy_manager_for(*args, **kwargs)
+
+
+class SecureSequentialThreadingHandler(SequentialThreadingHandler):
+    def create_connection(self, *args, **kwargs):
+        return create_tcp_connection(socket, options=SECURE_OPTIONS, ciphers=SECURE_CIPHERS,
+                                     *args, **kwargs)

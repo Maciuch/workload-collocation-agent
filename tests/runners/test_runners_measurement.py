@@ -18,11 +18,13 @@ import pytest
 
 from wca import storage
 from wca.containers import Container
+from wca.metrics import MissingMeasurementException
 from wca.mesos import MesosNode
-from wca.platforms import RDTInformation
-from wca.runners.measurement import MeasurementRunner, _build_tasks_metrics, _prepare_tasks_data
+from wca.resctrl import ResGroup
+from wca.runners.measurement import MeasurementRunner, _build_tasks_metrics, _prepare_tasks_data, \
+    TaskLabelRegexGenerator, TaskLabelGenerator, append_additional_labels_to_tasks
 from tests.testing import assert_metric, redis_task_with_default_labels, prepare_runner_patches, \
-    TASK_CPU_USAGE, WCA_MEMORY_USAGE, metric, DEFAULT_METRIC_VALUE, task
+    TASK_CPU_USAGE, WCA_MEMORY_USAGE, metric, DEFAULT_METRIC_VALUE, task, platform_mock
 
 
 @prepare_runner_patches
@@ -61,6 +63,14 @@ def test_measurements_runner(subcgroups):
                   expected_metric_value=cpu_usage)
     assert_metric(got_metrics, 'cpu_usage', dict(task_id=t2.task_id),
                   expected_metric_value=cpu_usage)
+
+    # Test whether application and application_version_name were properly generated using
+    #   default runner._task_label_generators defined in constructor of MeasurementsRunner.
+    assert_metric(got_metrics, 'cpu_usage',
+                  {'application': t1.name, 'application_version_name': ''})
+
+    # Test whether `initial_task_cpu_assignment` label is attached to task metrics.
+    assert_metric(got_metrics, 'cpu_usage', {'initial_task_cpu_assignment': '8.0'})
 
 
 @prepare_runner_patches
@@ -103,16 +113,75 @@ def test_build_tasks_metrics(tasks_labels, tasks_measurements, expected_metrics)
 @patch('wca.perf.PerfCounters')
 @patch('wca.containers.Container.get_measurements', Mock(return_value={'cpu_usage': 13}))
 def test_prepare_tasks_data(*mocks):
-    rdt_information = RDTInformation(True, True, True, True, '0', '0', 0, 0, 0)
     containers = {
         task('/t1', labels={'label_key': 'label_value'}, resources={'cpu': 3}):
-            Container('/t1', 1, 1, rdt_information)
+            Container('/t1', platform_mock)
     }
 
     tasks_measurements, tasks_resources, tasks_labels = _prepare_tasks_data(containers)
 
     assert tasks_measurements == {'t1_task_id': {'cpu_usage': 13}}
     assert tasks_resources == {'t1_task_id': {'cpu': 3}}
-    assert tasks_labels == {'t1_task_id': {'initial_task_cpu_assignment': 'unknown',
-                                           'label_key': 'label_value',
-                                           'task_id': 't1_task_id'}}
+    assert tasks_labels == {'t1_task_id': {'label_key': 'label_value'}}
+
+
+@patch('wca.cgroups.Cgroup')
+@patch('wca.resctrl.ResGroup.get_measurements', side_effect=MissingMeasurementException())
+@patch('wca.perf.PerfCounters')
+def test_prepare_task_data_resgroup_not_found(*mocks):
+    containers = {
+        task('/t1', labels={'label_key': 'label_value'}, resources={'cpu': 3}):
+            Container('/t1', platform_mock, resgroup=ResGroup('/t1'))
+    }
+    tasks_measurements, tasks_resources, tasks_labels = \
+        _prepare_tasks_data(containers)
+    assert tasks_measurements == {}
+
+
+@patch('wca.cgroups.Cgroup.get_measurements', side_effect=MissingMeasurementException())
+@patch('wca.perf.PerfCounters')
+def test_prepare_task_data_cgroup_not_found(*mocks):
+    containers = {
+        task('/t1', labels={'label_key': 'label_value'}, resources={'cpu': 3}):
+            Container('/t1', platform_mock)
+    }
+    tasks_measurements, tasks_resources, tasks_labels = \
+        _prepare_tasks_data(containers)
+    assert tasks_measurements == {}
+
+
+@pytest.mark.parametrize('source_val, pattern, repl, expected_val', (
+    ('__val__', '__(.*)__', r'\1', 'val'),
+    ('example/devel/staging-13/redis.small', r'.*/.*/.*/(.*)\..*', r'\1', 'redis'),
+    ('example/devel/staging-13/redis.small', r'non_matching_pattern', r'',
+     'example/devel/staging-13/redis.small'),
+))
+def test_task_label_regex_generator(source_val, pattern, repl, expected_val):
+    task1 = task('/t1', labels={'source_key': source_val})
+    task_label_regex_generator = TaskLabelRegexGenerator(pattern, repl, 'source_key')
+    assert expected_val == task_label_regex_generator.generate(task1)
+
+
+@patch('wca.runners.measurement.log')
+def test_append_additional_labels_to_tasks__generate_returns_None(log_mock):
+    """Generate method for generator returns None."""
+    class TestTaskLabelGenerator(TaskLabelGenerator):
+        def generate(self, task):
+            return None
+
+    task1 = task('/t1', labels={'source_key': 'source_val'})
+    append_additional_labels_to_tasks(
+        {'target_key': TestTaskLabelGenerator()},
+        [task1])
+    log_mock.debug.assert_called_once()
+
+
+@patch('wca.runners.measurement.log')
+def test_append_additional_labels_to_tasks__overwriting_label(log_mock):
+    """Should not ovewrite existing previously label."""
+    task1 = task('/t1', labels={'source_key': '__val__'})
+    append_additional_labels_to_tasks(
+        {'source_key': TaskLabelRegexGenerator('__(.*)__', '\\1', 'non_existing_key')},
+        [task1])
+    assert task1.labels['source_key'] == '__val__'
+    log_mock.debug.assert_called_once()

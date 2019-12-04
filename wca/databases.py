@@ -24,7 +24,7 @@ from typing import Optional, List
 from dataclasses import dataclass
 
 from wca.config import assure_type, Numeric, ValidationError
-from wca.security import SSL
+from wca.security import SSL, HTTPSAdapter, SecureSequentialThreadingHandler
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class LocalDatabase(Database):
     directory: str
 
     def __post_init__(self):
-        os.makedirs(self.directory)
+        os.makedirs(self.directory, exist_ok=True)
 
     def set(self, key: bytes, value: bytes):
         _validate_key(key)
@@ -120,6 +120,7 @@ class ZookeeperDatabase(Database):
                 self._client = KazooClient(
                         hosts=self.hosts,
                         timeout=self.timeout,
+                        handler=SecureSequentialThreadingHandler(),
                         use_ssl=True,
                         verify_certs=True,
                         ca=self.ssl.server_verify,
@@ -130,6 +131,7 @@ class ZookeeperDatabase(Database):
                 self._client = KazooClient(
                         hosts=self.hosts,
                         timeout=self.timeout,
+                        handler=SecureSequentialThreadingHandler(),
                         use_ssl=True,
                         verify_certs=self.ssl.server_verify,
                         certfile=self.ssl.client_cert_path,
@@ -193,7 +195,9 @@ class EtcdDatabase(Database):
             try:
                 full_url = '{}{}{}'.format(host, self.api_path, url)
                 if self.ssl:
-                    r = requests.post(
+                    s = requests.Session()
+                    s.mount(host, HTTPSAdapter())
+                    r = s.post(
                             full_url,
                             data=json.dumps(data),
                             timeout=self.timeout,
@@ -253,8 +257,7 @@ class EtcdDatabase(Database):
             raise TimeoutOnAllHosts(
                     'EtcdDatabase: Cannot get key "{}": Timeout on all hosts!'.format(key))
 
-        if 'kvs' in response_data:
-            if 'value' in response_data['kvs'][0]:
-                return base64.b64decode(response_data['kvs'][0]['value'])
+        if 'kvs' in response_data and 'value' in response_data['kvs'][0]:
+            return base64.b64decode(response_data['kvs'][0]['value'])
 
         return None

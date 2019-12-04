@@ -32,6 +32,9 @@ Building executable binary (distribution)
 
 File ``dist/wca.pex`` must be copied to ``/usr/bin/wca.pex``.
 
+To build distribution file with support for storing metrics in Kafka please follow
+`Building executable binary with KafkaStorage component enabled <kafka_storage.rst>`_ guide.
+
 Running
 ========
 
@@ -43,6 +46,22 @@ Runtime requirements
 - Python 3.6.x 
 
 All other the software dependencies are bundled using `PEX <https://github.com/pantsbuild/pex>`_.
+
+RDT enabling on Skylake processor
+---------------------------------
+
+It is possible to use RDT features on Skylake family of processors.
+However, there are known issues mentioned in
+`errata <https://www.intel.com/content/dam/www/public/us/en/documents/specification-updates/6th-gen-x-series-spec-update.pdf>`_:
+
+- SKZ4  MBM does not accurately track write bandwidth,
+- SKZ17 CMT counters may not count accurately,
+- SKZ18 CAT may not restrict cacheline allocation under certain conditions,
+- SKZ19 MBM counters may undercount.
+
+To enable RDT please add kernel boot time parameters ``rdt=cmt,mbmtotal,mbmlocal,l3cat``
+(`kernel documenatation <https://github.com/torvalds/linux/blob/f4eb1423e43376bec578c5696635b074c8bd2035/Documentation/admin-guide/kernel-parameters.txt#L4093>`_).
+
 
 Python 3.6 Centos installation (recommended)
 --------------------------------------------
@@ -61,7 +80,7 @@ Should output::
     Python 3.6.3
 
 Alternative options for Python 3.6 installation 
-----------------------------------------------
+-----------------------------------------------
 
 To simplify python interpreter management (no need to use ``scl`` tool as prefix), 
 you can use Intel Distribution for Python according to `yum-based installation guide <https://software.intel.com/en-us/articles/installing-intel-free-libs-and-python-yum-repo>`_.
@@ -78,14 +97,16 @@ Running WCA as non-root user
 
 WCA processes should not be run with root privileges. Following privileges are needed to run WCA as non-root user:
 
-- `CAP_DAC_OVERRIDE capability`_ - to allow non-root user writing to cgroups and resctrlfs kernel filesystems.
+- `CAP_DAC_OVERRIDE and CAP_SETUID capabilities`_ - for CPU discover and to allow non-root user writing to cgroups and resctrlfs kernel filesystems.
+- running process with `SECBIT_NO_SETUID_FIXUP`_ secure bit set, to not drop above capabilities when switching to unprivileged user,
 - ``/proc/sys/kernel/perf_event_paranoid`` - `content of the file`_ must be set to ``0`` or ``-1`` to allow non-root
   user to collect all the necessary event information.
 
 If it is impossible or undesired to run WCA with privileges outlined above, then you must add ``-0`` (or its
 long form: ``--root``) argument when starting the process)
 
-..  _`CAP_DAC_OVERRIDE capability`: https://github.com/torvalds/linux/blob/6f0d349d922ba44e4348a17a78ea51b7135965b1/include/uapi/linux/capability.h#L119
+..  _`SECBIT_NO_SETUID_FIXUP`: https://github.com/torvalds/linux/blob/master/include/uapi/linux/securebits.h#L32
+..  _`CAP_DAC_OVERRIDE and CAP_SETUID capabilities`: https://github.com/torvalds/linux/blob/6f0d349d922ba44e4348a17a78ea51b7135965b1/include/uapi/linux/capability.h#L119
 .. _`content of the file`: https://linux.die.net/man/2/perf_event_open
 
 Running as systemd service

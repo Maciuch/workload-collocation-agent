@@ -23,8 +23,8 @@ import requests
 from wca import logger
 from wca.config import assure_type, Numeric, Url, Str
 from wca.metrics import MetricName
-from wca.nodes import Node, Task, TaskId
-from wca.security import SSL
+from wca.nodes import Node, Task, TaskId, TaskSynchronizationException
+from wca.security import SSL, HTTPSAdapter
 
 DEFAULT_EVENTS = (MetricName.INSTRUCTIONS, MetricName.CYCLES, MetricName.CACHE_MISSES)
 
@@ -97,7 +97,9 @@ class KubernetesNode(Node):
         full_url = urljoin(self.kubelet_endpoint, PODS_PATH)
 
         if self.ssl:
-            r = requests.get(
+            s = requests.Session()
+            s.mount(self.kubelet_endpoint, HTTPSAdapter())
+            r = s.get(
                     full_url,
                     json=dict(type='GET_STATE'),
                     timeout=self.timeout,
@@ -115,7 +117,10 @@ class KubernetesNode(Node):
 
     def get_tasks(self) -> List[Task]:
         """Returns only running tasks."""
-        kubelet_json_response = self._request_kubelet()
+        try:
+            kubelet_json_response = self._request_kubelet()
+        except requests.exceptions.ConnectionError as e:
+            raise TaskSynchronizationException('%s' % e) from e
 
         tasks = []
         for pod in kubelet_json_response.get('items'):
@@ -132,6 +137,7 @@ class KubernetesNode(Node):
             pod_id = pod.get('metadata').get('uid')
             pod_name = pod.get('metadata').get('name')
             qos = pod.get('status').get('qosClass').lower()
+            task_name = pod.get('metadata').get('namespace') + "/" + pod_name
             assert QosClass.has_value(qos)
             if pod.get('metadata').get('labels'):
                 labels = {_sanitize_label(key): value
@@ -166,7 +172,7 @@ class KubernetesNode(Node):
 
             container_spec = pod.get('spec').get('containers')
             tasks.append(KubernetesTask(
-                name=pod_name, task_id=pod_id, qos=qos, labels=labels,
+                name=task_name, task_id=pod_id, qos=qos, labels=labels,
                 resources=_calculate_pod_resources(container_spec),
                 cgroup_path=_build_cgroup_path(self.cgroup_driver, qos, pod_id),
                 subcgroups_paths=containers_cgroups))
@@ -180,6 +186,9 @@ def _build_cgroup_path(cgroup_driver, qos, pod_id, container_id=''):
     """If cgroup for pod needed set container_id to empty string."""
     result: str = ""
     if cgroup_driver == CgroupDriverType.SYSTEMD:
+        pod_id = pod_id.replace("-", "_")
+        if container_id != "":
+            container_id = "docker-" + container_id + ".scope"
         result = os.path.join('/kubepods.slice',
                               'kubepods-{}.slice'.format(qos),
                               'kubepods-{}-pod{}.slice'.format(qos, pod_id),
@@ -196,9 +205,12 @@ def _build_cgroup_path(cgroup_driver, qos, pod_id, container_id=''):
     return result
 
 
-_MEMORY_UNITS = {'Ki': 1024, 'Mi': 1024**2, 'Gi': 1024**3, }
+# https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-memory
+_MEMORY_UNITS = {'Ki': 1024, 'Mi': 1024**2, 'Gi': 1024**3, 'Ti': 1024**4,
+                 'K': 1000, 'M': 1000**2, 'G': 1000**3, 'T': 1000**4}
 _CPU_UNITS = {'m': 0.001}
 _RESOURCE_TYPES = ['requests', 'limits']
+_MAPPING = {'requests_memory': 'mem', 'ephemeral-storage': 'disk', 'requests_cpu': 'cpus'}
 
 
 def _calculate_pod_resources(containers_spec: List[Dict[str, str]]):
@@ -231,6 +243,13 @@ def _calculate_pod_resources(containers_spec: List[Dict[str, str]]):
                     resources[resource_key] += float(value)
                 else:
                     resources[resource_key] = float(value)
+
+    # Mapping resource names to make them consistent with mesos
+    mapped_resources = dict()
+    for original_resource, mapped_resource in _MAPPING.items():
+        if original_resource in resources:
+            mapped_resources[mapped_resource] = resources[original_resource]
+    resources.update(mapped_resources)
 
     return resources
 

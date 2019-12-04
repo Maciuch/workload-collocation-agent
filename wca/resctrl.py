@@ -21,9 +21,9 @@ from typing import Tuple, List, Dict, Optional
 
 from wca import logger
 from wca.allocators import AllocationType, TaskAllocations, RDTAllocation
-from wca.allocations import InvalidAllocations
+from wca.allocations import InvalidAllocations, MissingAllocationException
 from wca.logger import TRACE
-from wca.metrics import Measurements, MetricName
+from wca.metrics import Measurements, MetricName, MissingMeasurementException
 from wca.security import SetEffectiveRootUid
 
 RESCTRL_ROOT_NAME = ''
@@ -35,6 +35,7 @@ INFO = 'info'
 MON_DATA = 'mon_data'
 MON_L3_00 = 'mon_L3_00'
 MBM_TOTAL = 'mbm_total_bytes'
+MBM_LOCAL = 'mbm_local_bytes'
 LLC_OCCUPANCY = 'llc_occupancy'
 RDT_MB = 'rdt_MB'
 RDT_LC = 'rdt_LC'
@@ -90,6 +91,7 @@ class ResGroup:
             return
 
         log.log(logger.TRACE, 'resctrl: write(%s): number_of_pids=%r', tasks_filepath, len(pids))
+        ftasks = None
         try:
             ftasks = open(tasks_filepath, 'w')
             with SetEffectiveRootUid():
@@ -117,7 +119,8 @@ class ResGroup:
             try:
                 # Try what we can to close the file but it is expected
                 # to fails because the wrong # data is waiting to be flushed
-                ftasks.close()
+                if ftasks is not None:
+                    ftasks.close()
             except (ProcessLookupError, FileNotFoundError, OSError):
                 log.warning('Could not close resctrl/tasks file - ignored!'
                             '(side-effect of previous warning!)')
@@ -137,8 +140,10 @@ class ResGroup:
         """Adds the pids to the resctrl group and creates mongroup with the pids.
            If the resctrl group does not exists creates it (lazy creation).
            If the mongroup exists adds pids to the group (no error will be thrown)."""
+        assert mongroup_name is not None and len(mongroup_name) > 0, 'mongroup_name cannot be empty'
+
         if self.name != RESCTRL_ROOT_NAME:
-            log.debug('creating restrcl group %r', self.name)
+            log.debug('creating resctrl group %r', self.name)
             self._create_controlgroup_directory()
 
         # CTRL GROUP
@@ -154,7 +159,15 @@ class ResGroup:
             os.makedirs(mongroup_fullpath, exist_ok=True)
         except OSError as e:
             if e.errno == errno.ENOSPC:  # "No space left on device"
-                raise Exception("Limit of workloads reached! (Oot of available CLoSes/RMIDs!)")
+                raise Exception("Limit of workloads reached! (Out of available CLoSes/RMIDs!)")
+            if e.errno == errno.EBUSY:  # "Device or resource busy"
+                raise Exception("Out of RMIDs! Too many RMIDs used or in "
+                                "limbo. If you encountered this problem it "
+                                "is probably related to one of known issues "
+                                "mentioned in Skylake processor's errata."
+                                "You could try to increase max "
+                                "threshold occupancy in /sys/fs/resctrl"
+                                "/info/L3_MON/max_threshold_occupancy file.")
             raise
         # ... and write the pids to the mongroup
         log.debug('add_pids: %d pids to %r', len(pids), os.path.join(mongroup_fullpath, 'tasks'))
@@ -188,10 +201,15 @@ class ResGroup:
                          cache_monitoring_enabled) -> Measurements:
         """
         mbm_total: Memory bandwidth - type: counter, unit: [bytes]
+
+        mbm_local: Local memory bandiwdth - type: counter, unit: [bytes]
+
+        mbm_remote: Remote memory bandwidth - type: counter, unit: [bytes]
         :return: Dictionary containing memory bandwidth
         and cpu usage measurements
         """
         mbm_total = 0
+        mbm_local = 0
         llc_occupancy = 0
 
         def _get_event_file(socket_dir, event_name):
@@ -205,17 +223,22 @@ class ResGroup:
                 if mb_monitoring_enabled:
                     with open(_get_event_file(socket_dir, MBM_TOTAL)) as mbm_total_file:
                         mbm_total += int(mbm_total_file.read())
+                    with open(_get_event_file(socket_dir, MBM_LOCAL)) as mbm_local_file:
+                        mbm_local += int(mbm_local_file.read())
+
                 if cache_monitoring_enabled:
                     with open(_get_event_file(socket_dir, LLC_OCCUPANCY)) as llc_occupancy_file:
                         llc_occupancy += int(llc_occupancy_file.read())
-        except FileNotFoundError:
-            log.warning("Could not read measurements from rdt - ignored! "
-                        "rdt group was not found (race detected)")
-            return {}
+        except FileNotFoundError as e:
+            raise MissingMeasurementException(
+                'File {} is missing. Measurement unavailable.'.format(
+                    e.filename))
 
         measurements = {}
         if mb_monitoring_enabled:
             measurements[MetricName.MEM_BW] = mbm_total
+            measurements[MetricName.MEMORY_BANDWIDTH_LOCAL] = mbm_local
+            measurements[MetricName.MEMORY_BANDWIDTH_REMOTE] = mbm_total - mbm_local
         if cache_monitoring_enabled:
             measurements[MetricName.LLC_OCCUPANCY] = llc_occupancy
         return measurements
@@ -223,12 +246,16 @@ class ResGroup:
     def get_allocations(self) -> TaskAllocations:
         """Return TaskAllocations representing allocation for RDT resource."""
         rdt_allocations_mb, rdt_allocations_l3 = None, None
-        with open(os.path.join(self.fullpath, SCHEMATA)) as schemata:
-            for line in schemata:
-                if 'MB:' in line:
-                    rdt_allocations_mb = line.strip()
-                elif 'L3:' in line:
-                    rdt_allocations_l3 = line.strip()
+        try:
+            with open(os.path.join(self.fullpath, SCHEMATA)) as schemata:
+                for line in schemata:
+                    if 'MB:' in line:
+                        rdt_allocations_mb = line.strip()
+                    elif 'L3:' in line:
+                        rdt_allocations_l3 = line.strip()
+        except FileNotFoundError as e:
+            raise MissingAllocationException(
+                'File {} is missing. Allocation unavailable.'.format(e.filename))
 
         rdt_allocations = RDTAllocation(
             name=self.name,
@@ -341,6 +368,7 @@ def check_resctrl():
     resctrl_tasks = os.path.join(BASE_RESCTRL_PATH, TASKS_FILENAME)
     try:
         with open(resctrl_tasks):
+            # Just check if possible to open a file.
             pass
     except IOError as e:
         log.log(TRACE, 'Error: Failed to open %s: %s', resctrl_tasks, e)

@@ -72,6 +72,7 @@ corresponding storage classes.
                 (defaults to instructions, cycles, cache-misses, memstalls)
             enable_derived_metrics: enable derived metrics ips, ipc and cache_hit_ratio
                 (based on enabled_event names), default to False
+            task_label_generators: component to generate additional labels for tasks
         """
 
         def __init__(
@@ -90,6 +91,7 @@ corresponding storage classes.
                 remove_all_resctrl_groups: bool = False,
                 event_names: Optional[List[str]] = None,
                 enable_derived_metrics: bool = False,
+                task_label_generators: Dict[str, TaskLabelGenerator] = None,
         ):
         ...
 
@@ -359,3 +361,8 @@ Returned ``TasksAllocations`` will be encoded in Prometheus exposition format:
 
     # TYPE allocations_ignored_count counter
     allocations_ignored_count{cores="28",cpus="56",host="igk-0107",wca_version="0.1.dev252+g7f83b7f",sockets="2"} 0 1547663933289
+
+
+Generating additional labels for tasks
+--------------------------------------
+Please refer to `Generating additional labels for tasks <detection.rst>`_.

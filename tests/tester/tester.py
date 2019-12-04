@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import List, Dict, Set, Union, Optional
 
+from wca.logger import init_logging
 from wca.allocators import Allocator, TasksAllocations
 from wca.config import load_config
 from wca.cgroups import CgroupSubsystem, CgroupType
@@ -18,7 +19,7 @@ from wca.platforms import Platform
 from wca.storage import Storage
 from tests.testing import assert_metric
 
-log = logging.getLogger(__name__)
+log = logging.getLogger('Tester')
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Tester(Node, Allocator, Storage):
     command: Optional[str] = None
 
     def __post_init__(self):
+        init_logging('info', 'Tester')
         self.testcases = load_config(self.config)['tests']
         self.testcases_count = len(self.testcases)
         self.current_iteration = 0
@@ -163,6 +165,7 @@ def _create_dumb_process(cgroup_path, command: str):
 def _get_cgroup_full_path(cgroup):
     return {
             CgroupType.CPU: os.path.join(CgroupSubsystem.CPU, cgroup[1:]),
+            CgroupType.MEMORY: os.path.join(CgroupSubsystem.MEMORY, cgroup[1:]),
             CgroupType.CPUSET: os.path.join(CgroupSubsystem.CPUSET, cgroup[1:]),
             CgroupType.PERF_EVENT: os.path.join(CgroupSubsystem.PERF_EVENT, cgroup[1:]),
             }
@@ -173,6 +176,11 @@ def _create_cgroup(cgroup_path):
 
     try:
         os.makedirs(paths[CgroupType.CPU])
+    except FileExistsError:
+        log.warning('cpu cgroup "{}" already exists'.format(cgroup_path))
+
+    try:
+        os.makedirs(paths[CgroupType.MEMORY])
     except FileExistsError:
         log.warning('cpu cgroup "{}" already exists'.format(cgroup_path))
 
@@ -192,6 +200,11 @@ def _delete_cgroup(cgroup_path):
 
     try:
         os.rmdir(paths[CgroupType.CPU])
+    except FileNotFoundError:
+        log.warning('cpu cgroup "{}" not found'.format(cgroup_path))
+
+    try:
+        os.rmdir(paths[CgroupType.MEMORY])
     except FileNotFoundError:
         log.warning('cpu cgroup "{}" not found'.format(cgroup_path))
 
@@ -245,8 +258,8 @@ class FileCheck(Check):
 @dataclass
 class MetricCheck(Check):
     name: str
-    labels: Optional[Dict] = None
-    value: Optional[Union[float, int]] = None
+    labels: Optional[Dict[str, str]] = None
+    value: Optional[Union[int, float, List[int]]] = None
 
     def check(self, metrics):
         assert_metric(metrics, self.name, self.labels, self.value)

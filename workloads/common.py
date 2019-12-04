@@ -28,6 +28,8 @@ job_name = os.getenv('job_name')
 
 application = os.getenv('application')
 load_generator = os.getenv('load_generator', None)
+application_version_name = os.environ.get('application_version_name',
+                                          workload_version_name)
 
 # Cluster job key identification.
 cluster = os.getenv('cluster', 'example')
@@ -47,10 +49,9 @@ slo = os.getenv('slo', 'inf')  # optional: default to inf
 # Docker image.
 image_tag = os.getenv('image_tag')
 image_name = os.getenv('image_name')
-# print('image_tag:', image_tag)
-# print('image_name:', image_name)
 
 # Resources:
+cpu_list = os.getenv('cpu_list', '0-999')
 cpu = os.getenv('cpu', '1')
 ram = os.getenv('ram', '1') + 'Gi'
 disk = os.getenv('disk', '1') + 'Gi'
@@ -75,9 +76,11 @@ wrapper_labels = {
                                     workload_version_name,
                                     env_uniq_id, job_uniq_id]),
     'replica_index': replica_index,
-    'name': job_name,       # not to break compability
+    'name': job_name,       # not to break compatibility
     'job_name': job_name,   #
     'application': application,
+    'application_version_name':
+        application_version_name,
     'load_generator': load_generator,
     'job_uniq_id': job_uniq_id,
     'env_uniq_id': env_uniq_id,

@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from abc import abstractmethod
+from dataclasses import dataclass
 import logging
 import resource
 import time
 from typing import Dict, List, Tuple, Optional
+import re
 
-from wca import nodes, storage, platforms, profiling
+from wca import nodes, storage, platforms, profiling, perf_const as pc
 from wca import resctrl
 from wca import security
 from wca.allocators import AllocationConfiguration
@@ -25,8 +28,10 @@ from wca.containers import ContainerManager, Container
 from wca.detectors import TasksMeasurements, TasksResources, TasksLabels
 from wca.logger import trace, get_logging_metrics
 from wca.mesos import create_metrics
-from wca.metrics import Metric, MetricType, MetricName
-from wca.nodes import Task
+from wca.metrics import Metric, MetricType, MetricName, \
+    MissingMeasurementException
+from wca.nodes import Task, TaskSynchronizationException
+from wca.platforms import CPUCodeName
 from wca.profiling import profiler
 from wca.runners import Runner
 from wca.storage import MetricPackage, DEFAULT_STORAGE
@@ -37,6 +42,44 @@ _INITIALIZE_FAILURE_ERROR_CODE = 1
 
 DEFAULT_EVENTS = (MetricName.INSTRUCTIONS, MetricName.CYCLES,
                   MetricName.CACHE_MISSES, MetricName.CACHE_REFERENCES, MetricName.MEMSTALL)
+
+
+class TaskLabelGenerator:
+    @abstractmethod
+    def generate(self, task: Task) -> Optional[str]:
+        """Generate new label value based on `task` object
+        (e.g. based on other label value or one of task resource).
+        `task` input parameter should not be modified."""
+        ...
+
+
+@dataclass
+class TaskLabelRegexGenerator(TaskLabelGenerator):
+    """Generate new label value based on other label value."""
+    pattern: str
+    repl: str
+    source: str = 'task_name'  # by default use `task_name`
+
+    def __post_init__(self):
+        # Verify whether syntax for pattern and repl is correct.
+        re.sub(self.pattern, self.repl, "")
+
+    def generate(self, task: Task) -> Optional[str]:
+        source_val = task.labels.get(self.source, None)
+        if source_val is None:
+            err_msg = "Source label {} not found in task {}".format(self.source, task.name)
+            log.warning(err_msg)
+            return None
+        return re.sub(self.pattern, self.repl, source_val)
+
+
+@dataclass
+class TaskLabelResourceGenerator(TaskLabelGenerator):
+    """Add label based on initial resource assignment of a task."""
+    resource_name: str
+
+    def generate(self, task: Task) -> Optional[str]:
+        return str(task.resources.get(self.resource_name, "unknown"))
 
 
 class MeasurementRunner(Runner):
@@ -57,6 +100,7 @@ class MeasurementRunner(Runner):
             (defaults to instructions, cycles, cache-misses, memstalls)
         enable_derived_metrics: enable derived metrics ips, ipc and cache_hit_ratio
             (based on enabled_event names), default to False
+        task_label_generators: component to generate additional labels for tasks
     """
 
     def __init__(
@@ -66,8 +110,9 @@ class MeasurementRunner(Runner):
             action_delay: Numeric(0, 60) = 1.,  # [s]
             rdt_enabled: Optional[bool] = None,  # Defaults(None) - auto configuration.
             extra_labels: Dict[Str, Str] = None,
-            event_names: List[str] = None,
+            event_names: List[str] = DEFAULT_EVENTS,
             enable_derived_metrics: bool = False,
+            task_label_generators: Dict[str, TaskLabelGenerator] = None,
             _allocation_configuration: Optional[AllocationConfiguration] = None,
     ):
 
@@ -83,8 +128,28 @@ class MeasurementRunner(Runner):
         self._finish = False  # Guard to stop iterations.
         self._last_iteration = time.time()  # Used internally by wait function.
         self._allocation_configuration = _allocation_configuration
-        self._event_names = event_names or DEFAULT_EVENTS
+        self._event_names = event_names
+
         self._enable_derived_metrics = enable_derived_metrics
+
+        # Default value for task_labels_generator.
+        if task_label_generators is None:
+            self._task_label_generators = {
+                'application':
+                    TaskLabelRegexGenerator('$', '', 'task_name'),
+                'application_version_name':
+                    TaskLabelRegexGenerator('.*$', '', 'task_name'),
+            }
+        else:
+            self._task_label_generators = task_label_generators
+        # Generate label value with cpu initial assignment, to simplify
+        #   management of distributed model system for plugin:
+        #   https://github.com/intel/platform-resource-manager/tree/master/prm"""
+        #
+        # To not risk subtle bugs in 1.0.x do not add it to _task_label_generators as default,
+        #   but make it hardcoded here and possible do be removed.
+        self._task_label_generators['initial_task_cpu_assignment'] = \
+            TaskLabelResourceGenerator('cpus')
 
     @profiler.profile_duration(name='sleep')
     def _wait(self):
@@ -102,11 +167,13 @@ class MeasurementRunner(Runner):
         """Check privileges, RDT availability and prepare internal state.
         Can return error code that should stop Runner.
         """
-        if not security.are_privileges_sufficient(self._rdt_enabled):
-            log.error("Impossible to use perf_event_open/resctrl subsystems. "
-                      "You need to: adjust /proc/sys/kernel/perf_event_paranoid (set to -1); "
-                      "or has CAP_DAC_OVERRIDE and CAP_SETUID capabilities set."
-                      "You can run process as root too.")
+        if not security.are_privileges_sufficient():
+            log.error("Insufficient privileges! "
+                      "Impossible to use perf_event_open/resctrl subsystems. "
+                      "For unprivileged user it is needed to: "
+                      "adjust /proc/sys/kernel/perf_event_paranoid (set to -1), "
+                      "has CAP_DAC_OVERRIDE and CAP_SETUID capabilities and"
+                      "SECBIT_NO_SETUID_FIXUP secure bit set.")
             return 1
 
         # Initialization (auto discovery Intel RDT features).
@@ -131,6 +198,9 @@ class MeasurementRunner(Runner):
         platform, _, _ = platforms.collect_platform_information(self._rdt_enabled)
         rdt_information = platform.rdt_information
 
+        self._event_names = _filter_out_event_names_for_cpu(
+                self._event_names, platform.cpu_codename)
+
         # We currently do not support RDT without monitoring.
         if self._rdt_enabled and not rdt_information.is_monitoring_enabled():
             log.error('RDT monitoring is required - please enable CAT '
@@ -138,9 +208,7 @@ class MeasurementRunner(Runner):
             return 1
 
         self._containers_manager = ContainerManager(
-            rdt_information=rdt_information,
-            platform_cpus=platform_cpus,
-            platform_sockets=platform_sockets,
+            platform=platform,
             allocation_configuration=self._allocation_configuration,
             event_names=self._event_names,
             enable_derived_metrics=self._enable_derived_metrics,
@@ -151,15 +219,15 @@ class MeasurementRunner(Runner):
         iteration_start = time.time()
 
         # Get information about tasks.
-        tasks = self._node.get_tasks()
-        log.debug('Tasks detected: %d', len(tasks))
+        try:
+            tasks = self._node.get_tasks()
+        except TaskSynchronizationException as e:
+            log.error('Cannot synchronize tasks with node (error=%s) - skip this iteration!', e)
+            self._wait()
+            return
 
-        for task in tasks:
-            sanitized_labels = dict()
-            for label_key, label_value in task.labels.items():
-                sanitized_labels.update({sanitize_label(label_key):
-                                         label_value})
-            task.labels = sanitized_labels
+        append_additional_labels_to_tasks(self._task_label_generators, tasks)
+        log.debug('Tasks detected: %d', len(tasks))
 
         # Keep sync of found tasks and internally managed containers.
         containers = self._containers_manager.sync_containers_state(tasks)
@@ -221,6 +289,30 @@ class MeasurementRunner(Runner):
         return True
 
 
+def append_additional_labels_to_tasks(task_label_generators: Dict[str, TaskLabelGenerator],
+                                      tasks: List[Task]) -> None:
+    for task in tasks:
+        # Add labels uniquely identifying a task.
+        task.labels['task_id'] = task.task_id
+        task.labels['task_name'] = task.name
+
+        # Generate new labels based on formula inputted by a user (using TasksLabelGenerator).
+        for target, task_label_generator in task_label_generators.items():
+            if target in task.labels:
+                err_msg = "Target label {} already existing in task {}. Skipping.".format(
+                    target, task.name)
+                log.debug(err_msg)
+                continue
+            val = task_label_generator.generate(task)
+            if val is None:
+                log.debug('Label {} for task {} not set, as its value is None.'
+                          .format(target, task.name))
+            else:
+                if val == "":
+                    log.debug('Label {} for task {} set to empty string.'.format(target, task.name))
+                task.labels[target] = val
+
+
 @profiler.profile_duration('prepare_tasks_data')
 @trace(log, verbose=False)
 def _prepare_tasks_data(containers: Dict[Task, Container]) -> \
@@ -235,25 +327,15 @@ def _prepare_tasks_data(containers: Dict[Task, Container]) -> \
 
     for task, container in containers.items():
         # Task measurements and measurements based metrics.
-        task_measurements = container.get_measurements()
-        if not task_measurements:
-            log.warning('there is not measurements collected for container %r - ignoring!',
-                        container)
+        try:
+            task_measurements = container.get_measurements()
+        except MissingMeasurementException as e:
+            log.warning('One or more measurements are missing '
+                        'for container {} - ignoring! '
+                        '(because {})'.format(container, e))
             continue
 
-        # Prepare tasks labels based on tasks metadata labels and task id.
-        task_labels = {
-            sanitize_label(label_key): label_value
-            for label_key, label_value
-            in task.labels.items()
-        }
-        task_labels['task_id'] = task.task_id
-
-        # Add additional label with cpu initial assignment, to simplify
-        # management of distributed model system for plugin:
-        # https://github.com/intel/platform-resource-manager/tree/master/prm
-        task_labels['initial_task_cpu_assignment'] = \
-            str(task.resources.get('cpus', task.resources.get('cpu_limits', "unknown")))
+        task_labels = task.labels.copy()
 
         # Aggregate over all tasks.
         tasks_labels[task.task_id] = task_labels
@@ -294,19 +376,26 @@ def _get_internal_metrics(tasks: List[Task]) -> List[Metric]:
     return metrics
 
 
-MESOS_LABELS_PREFIXES_TO_DROP = ('org.apache.', 'aurora.metadata.')
+def _filter_out_event_names_for_cpu(
+        event_names: List[str], cpu_codename: CPUCodeName) -> List[MetricName]:
+    """Filter out events that cannot be collected on given cpu."""
 
+    filtered_event_names = []
 
-def sanitize_label(label_key):
-    """Removes unwanted prefixes from Aurora & Mesos e.g. 'org.apache.aurora'
-    and replaces invalid characters like "." with underscore.
-    """
-    # Drop unwanted prefixes
-    for unwanted_prefix in MESOS_LABELS_PREFIXES_TO_DROP:
-        if label_key.startswith(unwanted_prefix):
-            label_key = label_key.replace(unwanted_prefix, '')
+    for event_name in event_names:
+        if event_name in pc.HardwareEventNameMap:
+            # Universal metrics that works on all cpus.
+            filtered_event_names.append(event_name)
+        elif event_name in pc.PREDEFINED_RAW_EVENTS:
+            if cpu_codename in pc.PREDEFINED_RAW_EVENTS[event_name]:
+                filtered_event_names.append(event_name)
+            else:
+                log.warning('Event %r not supported for %s!', event_name, cpu_codename.value)
+                continue
+        elif '__r' in event_name:
+            # Pass all raw events.
+            filtered_event_names.append(event_name)
+        else:
+            raise Exception('Unknown event name %r!' % event_name)
 
-    # Prometheus labels cannot contain ".".
-    label_key = label_key.replace('.', '_')
-
-    return label_key
+    return filtered_event_names

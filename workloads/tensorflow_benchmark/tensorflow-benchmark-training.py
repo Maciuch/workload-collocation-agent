@@ -16,9 +16,10 @@
 
 from common import command, json, pod, \
     wrapper_kafka_topic, wrapper_kafka_brokers, wrapper_log_level, \
-    wrapper_labels, slo
+    wrapper_labels, slo, cpu_list
 
 command.append(
+    "/usr/bin/taskset -c {cpu_list} "
     "/tensorflow_benchmark_training_wrapper.pex --command '/usr/bin/python3.5"
     " -u /root/benchmarks/scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py "
     "--datasets_use_prefetch=True --batch_group_size=1 --device=cpu "
@@ -31,11 +32,12 @@ command.append(
     "--slo {slo} --sli_metric_name tensorflow_benchmark_training_speed "
     "--inverse_sli_metric_value "
     "--peak_load 1 --load_metric_name const "
-    "--labels \"{labels}\"".format(
+    "--labels '{labels}'".format(
+                cpu_list=cpu_list,
                 kafka_brokers=wrapper_kafka_brokers,
                 log_level=wrapper_log_level,
                 kafka_topic=wrapper_kafka_topic,
-                labels=wrapper_labels, slo=slo))
+                labels=json.dumps(wrapper_labels), slo=slo))
 
 
 json_format = json.dumps(pod)

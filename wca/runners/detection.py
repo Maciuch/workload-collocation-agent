@@ -21,7 +21,7 @@ from wca.detectors import convert_anomalies_to_metrics, \
     update_anomalies_metrics_with_task_information, Anomaly
 from wca.metrics import Metric, MetricType
 from wca.profiling import profiler
-from wca.runners.measurement import MeasurementRunner
+from wca.runners.measurement import MeasurementRunner, TaskLabelGenerator, DEFAULT_EVENTS
 from wca.storage import MetricPackage, DEFAULT_STORAGE
 
 log = logging.getLogger(__name__)
@@ -76,6 +76,7 @@ class DetectionRunner(MeasurementRunner):
             (defaults to instructions, cycles, cache-misses, memstalls)
         enable_derived_metrics: enable derived metrics ips, ipc and cache_hit_ratio
             (based on enabled_event names), default to False
+        task_label_generators: component to generate additional labels for tasks
     """
 
     def __init__(
@@ -87,13 +88,14 @@ class DetectionRunner(MeasurementRunner):
             action_delay: Numeric(0, 60) = 1.,
             rdt_enabled: Optional[bool] = None,
             extra_labels: Dict[Str, Str] = None,
-            event_names: Optional[List[str]] = None,
+            event_names: Optional[List[str]] = DEFAULT_EVENTS,
             enable_derived_metrics: bool = False,
+            task_label_generators: Dict[str, TaskLabelGenerator] = None,
     ):
         super().__init__(node, metrics_storage,
                          action_delay, rdt_enabled,
                          extra_labels, event_names,
-                         enable_derived_metrics)
+                         enable_derived_metrics, task_label_generators)
         self._detector = detector
 
         # Anomaly.

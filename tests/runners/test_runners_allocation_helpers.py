@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.testing import allocation_metric, task, container
+from tests.testing import platform_mock
 from wca.allocations import InvalidAllocations
 from wca.allocators import AllocationType, RDTAllocation, AllocationConfiguration
 from wca.cgroups import Cgroup
@@ -26,9 +28,8 @@ from wca.resctrl_allocations import RDTGroups, RDTAllocationValue
 from wca.runners.allocation import (TasksAllocationsValues,
                                     TaskAllocationsValues,
                                     AllocationRunner,
-                                    validate_shares_allocation_for_kubernetes)
-from tests.testing import allocation_metric, task, container
-from tests.testing import platform_mock
+                                    validate_shares_allocation_for_kubernetes,
+                                    _get_tasks_allocations)
 
 
 @pytest.mark.parametrize('tasks_allocations, expected_metrics', (
@@ -94,12 +95,12 @@ rdta = RDTAllocation
          {"rdt": rdta(name='', l3='L3:0=ff')}, {"rdt": rdta(name='', l3='L3:0=ff')}),
         ({"rdt": rdta(name='', l3='L3:0=ff')}, {},
          {"rdt": rdta(name='', l3='L3:0=ff')}, None),
-        ({"rdt": rdta(name='', l3='L3:0=ff')},  {"rdt": rdta(name='x', l3='L3:0=ff')},
+        ({"rdt": rdta(name='', l3='L3:0=ff')}, {"rdt": rdta(name='x', l3='L3:0=ff')},
          {"rdt": rdta(name='x', l3='L3:0=ff')}, {"rdt": rdta(name='x', l3='L3:0=ff')}),
         ({"rdt": rdta(name='x', l3='L3:0=ff')}, {"rdt": rdta(name='x', l3='L3:0=dd')},
          {"rdt": rdta(name='x', l3='L3:0=dd')}, {"rdt": rdta(name='x', l3='L3:0=dd')}),
         ({"rdt": rdta(name='x', l3='L3:0=dd', mb='MB:0=ff')},
-            {"rdt": rdta(name='x', mb='MB:0=ff')},
+         {"rdt": rdta(name='x', mb='MB:0=ff')},
          {"rdt": rdta(name='x', l3='L3:0=dd', mb='MB:0=ff')}, None),
     ]
 )
@@ -298,6 +299,7 @@ def test_rdt_initialize(rdt_max_values_mock, cleanup_resctrl_mock,
             spec=RDTInformation,
             cbm_mask='fff', min_cbm_bits='2',
             mb_min_bandwidth=10,
+            mb_bandwidth_gran=10,
             rdt_mb_control_enabled=platform_rdt_mb_control_enabled,
             rdt_cache_control_enabled=platform_rdt_cache_control_enabled)):
         assert runner._initialize_rdt() is not expected_error
@@ -316,9 +318,9 @@ def test_rdt_initialize(rdt_max_values_mock, cleanup_resctrl_mock,
 @pytest.mark.parametrize(
     'allocations, should_raise_exception',
     (
-        ({'t1': {AllocationType.SHARES: 10}}, True),
-        ({'t1': {AllocationType.QUOTA: 100}}, False),
-        ({'t1': {AllocationType.QUOTA: 100}, 't2': {AllocationType.SHARES: 10}}, True),
+            ({'t1': {AllocationType.SHARES: 10}}, True),
+            ({'t1': {AllocationType.QUOTA: 100}}, False),
+            ({'t1': {AllocationType.QUOTA: 100}, 't2': {AllocationType.SHARES: 10}}, True),
     )
 )
 def test_validate_shares_allocation_for_kubernetes(mock_1, mock_2, allocations,
@@ -326,3 +328,14 @@ def test_validate_shares_allocation_for_kubernetes(mock_1, mock_2, allocations,
     if should_raise_exception:
         with pytest.raises(InvalidAllocations):
             validate_shares_allocation_for_kubernetes(tasks=[], allocations=allocations)
+
+
+@patch('builtins.open', side_effect=FileNotFoundError())
+def test_get_tasks_allocations_fail(*mock):
+    containers = {
+        task('/t1', labels={'label_key': 'label_value'}, resources={'cpu': 3}):
+            Container('/t1', platform_mock,
+                      allocation_configuration=AllocationConfiguration(
+                          cpu_quota_period=1000))
+    }
+    assert {} == _get_tasks_allocations(containers)
