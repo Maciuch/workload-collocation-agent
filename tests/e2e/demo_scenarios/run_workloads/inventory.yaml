@@ -53,9 +53,9 @@ application_hosts:
             image_name: cassandra
             image_tag: 3.11.3
             resources:
-              cpu: 3
-              ram: 5
-              disk: 5
+              cpu: 5
+              ram: 10
+              disk: 10
           ycsb:
             resources:
               cpu: 3
@@ -79,6 +79,31 @@ application_hosts:
               cpu: 2
               ram: 5
               disk: 5
+
+      twemcache_mutilate:
+        default:
+          count: 1
+          slo: 500
+          communication_port: 11211
+          twemcache:
+            env:
+              worker_threads: 2
+              max_memory: 4024
+            resources:
+              cpu: 2
+              ram: 10
+              disk: 10
+          mutilate:
+            env:
+              sli_percentile: 95
+              threads: 2
+              connections: 1
+              warmup_time: 20
+              qps: 20000
+            resources:
+              cpu: 2
+              ram: 10
+              disk: 10
 
       specjbb:
         default:
@@ -107,7 +132,7 @@ application_hosts:
           timeout: 30
           stressor: stream
           slo: inf
-          number_workers: 2
+          number_workers: 1
           resources:
             cpu: 1
             ram: 2

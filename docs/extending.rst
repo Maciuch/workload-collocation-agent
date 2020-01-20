@@ -56,10 +56,9 @@ it effectively means running equivalent of Python code:
 .. code-block:: python
 
     runner = MeasurementRunner(
-        node = MesosNode()
-        metric_storage = LogStorage(
-            output_filename = '/tmp/logs.txt'
-        )
+       node = MesosNode()
+       metric_storage = LogStorage(
+       output_filename = '/tmp/logs.txt')
     )
     runner.run()
 
@@ -102,7 +101,7 @@ and then with WCA started like this
 
 .. code-block:: shell
 
-    PYTHONPATH=$PWD/example PEX_INHERIT_PATH=fallback ./dist/wca.pex -c $PWD/configs/extending/hello_world.yaml -r hello_world_runner:HelloWorldRunner
+    PYTHONPATH=$PWD/examples PEX_INHERIT_PATH=fallback ./dist/wca.pex -c $PWD/configs/extending/hello_world.yaml -r hello_world_runner:HelloWorldRunner
 
 :Tip: You can just copy-paste this command, all required example files are already in project, but you have to build pex file first with ``make``.
 
@@ -172,9 +171,10 @@ then in can be used with ``MeasurementRunner`` with following `configuration fil
 .. code-block:: yaml
 
     runner: !MeasurementRunner
-      node: !StaticNode
-        tasks: []                   # this disables any tasks metrics
-      metrics_storage: !HTTPStorage
+      config: !MeasurementRunnerConfig
+        node: !StaticNode
+          tasks: []                   # this disables any tasks metrics
+        metrics_storage: !HTTPStorage
 
 To be able to verify that data was posted to http service correctly please start naive service
 using ``socat``:
@@ -187,8 +187,7 @@ and then run WCA like this:
 
 .. code-block:: shell
 
-    sudo env PYTHONPATH=example PEX_INERHITPATH=1 ./dist/wca.pex -c $PWD/configs/extending/measurement_http_storage.yaml -r http_storage:HTTPStorage --root --log http_storage:info
-
+ sudo env PYTHONPATH=$PWD/examples PEX_INHERIT_PATH=fallback ./dist/wca.pex -c $PWD/configs/extending/measurement_http_storage.yaml -r http_store:HTTPStorage --root --log http_storage:info
 
 Expected output is:
 
@@ -272,14 +271,15 @@ Note that it is possible by using `YAML anchors and aliases <https://yaml.org/re
 .. code-block:: yaml
 
     runner: !AllocationRunner
-      metrics_storage: &kafka_storage_instance !KafkaStorage
-        topic: all_metrics
-        broker_ips: 
-        - 127.0.0.1:9092
-        - 127.0.0.2:9092
-        max_timeout_in_seconds: 5.
-      anomalies_storage: *kafka_storage_instance
-      allocations_storage: *kafka_storage_instance
+      config: !AllocationRunnerConfig
+        metrics_storage: &kafka_storage_instance !KafkaStorage
+          topic: all_metrics
+          broker_ips: 
+          - 127.0.0.1:9092
+          - 127.0.0.2:9092
+          max_timeout_in_seconds: 5.
+        anomalies_storage: *kafka_storage_instance
+        allocations_storage: *kafka_storage_instance
 
 This approach can help to save resources (like connections), share state or simplify configuration (no need to repeat the same arguments).
             
@@ -296,7 +296,7 @@ use `PEX <https://github.com/pantsbuild/pex>`_ file to package all source code i
 
 .. code-block:: shell
 
-    pex -D example python-dateutil==2.8.0 -o hello_world.pex -v
+    pex -D examples python-dateutil==2.8.0 -o hello_world.pex -v
 
 
 where ``example/hello_world_runner_with_dateutil.py``:
@@ -339,7 +339,3 @@ Any children object that is used by any runner, can be replaced with extrnal com
 - ``Storage`` classes used to enable persistance for internal metrics (``*_storage`` properties),
 - ``Detector`` class to provide anomaly detection logic,
 - ``Allocator`` class to provide anomaly detection and anomaly mittigation logic (by resource allocation),
-
-
-
-

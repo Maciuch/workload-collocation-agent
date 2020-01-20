@@ -1,13 +1,20 @@
 pipeline {
     agent any
     parameters {
-      booleanParam defaultValue: true, description: 'Build workload images.', name: 'BUILD_IMAGES'
+      booleanParam defaultValue: true, description: 'Run all pre-checks.', name: 'PRECHECKS'
+      booleanParam defaultValue: true, description: 'Build WCA image.', name: 'BUILD_WCA_IMAGE'
+      booleanParam defaultValue: true, description: 'Build wrappers and workload images.', name: 'BUILD_IMAGES'
+      booleanParam defaultValue: true, description: 'E2E for Mesos.', name: 'E2E_MESOS'
+      booleanParam defaultValue: true, description: 'E2E for Kubernetes.', name: 'E2E_K8S'
+      booleanParam defaultValue: true, description: 'E2E for Kubernetes as Daemonset.', name: 'E2E_K8S_DS'
+      string defaultValue: '200', description: 'Sleep time for E2E tests', name: 'SLEEP_TIME'
     }
     environment {
-        DOCKER_REPOSITORY_URL = credentials('DOCKER_REPOSITORY_URL')
+        DOCKER_REPOSITORY_URL = '100.64.176.12:80'
     }
     stages{
         stage("Flake8 formatting scan") {
+            when {expression{return params.PRECHECKS}}
             steps {
                 sh '''
                   make venv flake8
@@ -15,9 +22,10 @@ pipeline {
             }
         }
         stage("Run unit tests suite") {
+            when {expression{return params.PRECHECKS}}
             steps {
                 sh '''
-                  make venv junit
+                  make junit
                 '''
             }
             post {
@@ -26,22 +34,46 @@ pipeline {
                 }
             }
         }
-        stage("Build WCA pex") {
+        stage("Generate documentation") {
+            when {expression{return params.PRECHECKS}}
+            steps {
+                generate_docs()
+            }
+        }
+        stage("Build WCA pex (in docker and images)") {
+            when {expression{return params.BUILD_WCA_IMAGE}}
             steps {
                 sh '''
+                  echo GIT_COMMIT=${GIT_COMMIT}
+                  export WCA_IMAGE=${DOCKER_REPOSITORY_URL}/wca
+                  export WCA_TAG=${GIT_COMMIT}
                   make wca_package_in_docker
+                  docker push $WCA_IMAGE:$WCA_TAG
+                  # tag with branch name and push
+                  docker tag $WCA_IMAGE:$WCA_TAG $WCA_IMAGE:${GIT_BRANCH}
+                  docker push $WCA_IMAGE:${GIT_BRANCH}
+
+                  # Just for completeness (not used later)
+                  export WCA_TAG=${GIT_BRANCH}-devel 
+                  make _wca_docker_devel
+                  docker push $WCA_IMAGE:$WCA_TAG
                 '''
             }
         }
         stage("Build pex files") {
+            when {expression{return params.BUILD_IMAGES}}
             steps {
                 sh '''
-                  make venv wrapper_package
+                  # speed up pex wrapper build time
+                  # requieres .pex-build already filled with requirments
+                  #export ADDITIONAL_PEX_OPTIONS='--no-index --cache-ttl=604800'
+                  make _unsafe_wrapper_package
                 '''
                 archiveArtifacts(artifacts: "dist/**")
             }
         }
         stage("Check code with bandit") {
+            when {expression{return params.PRECHECKS}}
              steps {
              sh '''
                make bandit bandit_pex
@@ -49,121 +81,182 @@ pipeline {
              archiveArtifacts(artifacts: "wca-bandit.html, wca-pex-bandit.html")
            }
         }
-        stage("Build and push Workload Collocation Agent Docker image") {
-            steps {
-                sh '''
-                IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca:${GIT_COMMIT}
-                IMAGE_DIR=${WORKSPACE}
-
-                docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
-                docker push ${IMAGE_NAME}
-                '''
-            }
-        }
         stage("Building Docker images and do tests in parallel") {
             parallel {
-                stage("Using tester") {
-                    steps {
-                        sh '''
-			sudo chmod 700 $(pwd)/tests/tester/configs/tester_example.yaml
-                        sudo bash -c "
-                        PEX_INHERIT_PATH=fallback PYTHONPATH="$(pwd):$(pwd)/tests/tester" dist/wca.pex -c $(pwd)/tests/tester/configs/tester_example.yaml \
-                        -r tester:Tester -r tester:MetricCheck -r tester:FileCheck \
-                        --log=debug --root
-                        "
-                    '''
-                    }
-                }
+                 stage("Using tester") {
+                     when {expression{return params.PRECHECKS}}
+                     steps {
+                     sh '''
+			         make tester
+                     '''
+                     }
+                 }
+                // Redis
                 stage("Build and push Redis Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/redis:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/redis
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/redis:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/redis
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
-                stage("Build and push stress-ng Docker image") {
+                // memtier_benchmark
+                stage("Build and push memtier_benchmark Docker image") {
+                    when {expression{return params.BUILD_IMAGES}}
+                    steps {
+                    sh '''
+                    IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/memtier_benchmark:${GIT_COMMIT}
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/memtier_benchmark:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/memtier_benchmark
+                    cp -r dist ${IMAGE_DIR}
+                    docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
+                    docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
+                    '''
+                    }
+                }
+                // stress_ng
+                stage("Build and push stress_ng Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/stress_ng:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/stress_ng
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/stress_ng:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/stress_ng
                     cp -r dist ${IMAGE_DIR}
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
-                stage("Build and push rpc-perf Docker image") {
+                // rpc_perf
+                stage("Build and push rpc_perf Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/rpc_perf:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/rpc_perf
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/rpc_perf:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/rpc_perf
                     cp -r dist ${IMAGE_DIR}
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
+                // Twemcache
                 stage("Build and push Twemcache Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/twemcache:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/twemcache
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/twemcache:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/twemcache
                     cp -r dist ${IMAGE_DIR}
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
+                // YCSB
                 stage("Build and push YCSB Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/ycsb:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/ycsb
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/ycsb:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/ycsb
                     cp -r dist ${IMAGE_DIR}
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
+                // Stress
                 stage("Build and push Cassandra Stress Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                     sh '''
                     IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/cassandra_stress:${GIT_COMMIT}
-                    IMAGE_DIR=${WORKSPACE}/workloads/cassandra_stress
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/cassandra_stress:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/cassandra_stress
                     cp -r dist ${IMAGE_DIR}
                     docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                     docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
                     '''
                     }
                 }
+                // Sysbench
+                stage("Build and push Sysbench Docker image") {
+                    when {expression{return params.BUILD_IMAGES}}
+                    steps {
+                    sh '''
+                    IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/sysbench:${GIT_COMMIT}
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/sysbench:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/sysbench
+                    cp -r dist ${IMAGE_DIR}
+                    docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
+                    docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
+                    '''
+                    }
+                }
+                // Mutilate
+                stage("Build and push Mutilate Docker image") {
+                    when {expression{return params.BUILD_IMAGES}}
+                    steps {
+                    sh '''
+                    IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/mutilate:${GIT_COMMIT}
+                    BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/mutilate:${GIT_BRANCH}
+                    IMAGE_DIR=${WORKSPACE}/examples/workloads/mutilate
+                    cp -r dist ${IMAGE_DIR}
+                    docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
+                    docker push ${IMAGE_NAME}
+                    docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                    docker push ${BRANCH_IMAGE_NAME}
+                    '''
+                    }
+                }
+                // SpecJBB
                 stage("Build and push SpecJBB Docker image") {
                     when {expression{return params.BUILD_IMAGES}}
                     steps {
                         withCredentials([file(credentialsId: 'specjbb', variable: 'SPECJBB_TAR')]) {
                             sh '''
                             IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/specjbb:${GIT_COMMIT}
-                            IMAGE_DIR=${WORKSPACE}/workloads/specjbb
+                            BRANCH_IMAGE_NAME=${DOCKER_REPOSITORY_URL}/wca/specjbb:${GIT_BRANCH}
+                            IMAGE_DIR=${WORKSPACE}/examples/workloads/specjbb
                             cp ${SPECJBB_TAR} ${IMAGE_DIR}
                             tar -xC ${IMAGE_DIR} -f ${IMAGE_DIR}/specjbb.tar.bz2
                             cp -r dist ${IMAGE_DIR}
                             docker build -t ${IMAGE_NAME} -f ${IMAGE_DIR}/Dockerfile ${IMAGE_DIR}
                             docker push ${IMAGE_NAME}
+                            docker tag ${IMAGE_NAME} ${BRANCH_IMAGE_NAME}
+                            docker push ${BRANCH_IMAGE_NAME}
                             '''
                         }
                     }
                     post {
                         always {
                             sh '''
-                            rm -rf ${WORKSPACE}/workloads/specjbb/specjbb.tar.bz2 ${WORKSPACE}/workloads/specjbb/specjbb ${WORKSPACE}/workloads/specjbb/dist
+                            rm -rf ${WORKSPACE}/examples/workloads/specjbb/specjbb.tar.bz2 ${WORKSPACE}/examples/workloads/specjbb/specjbb ${WORKSPACE}/examples/workloads/specjbb/dist
                             '''
                         }
                     }
@@ -186,18 +279,41 @@ pipeline {
             }
             environment {
                 /* For E2E tests. */
-                PLAYBOOK = 'workloads/run_workloads.yaml'
+                PLAYBOOK = 'examples/workloads/run_workloads.yaml'
                 PROMETHEUS = 'http://100.64.176.12:9090'
                 BUILD_COMMIT="${GIT_COMMIT}"
                 EXTRA_ANSIBLE_PARAMS = " "
                 LABELS="{additional_labels: {build_number: \"${BUILD_NUMBER}\", build_node_name: \"${NODE_NAME}\", build_commit: \"${GIT_COMMIT}\"}}"
-                RUN_WORKLOADS_SLEEP_TIME = 300
+                RUN_WORKLOADS_SLEEP_TIME = "${params.SLEEP_TIME}"
                 INVENTORY="tests/e2e/demo_scenarios/common/inventory.yaml"
-                TAGS = "redis_rpc_perf,cassandra_stress,cassandra_ycsb,twemcache_rpc_perf,specjbb,stress_ng"
+                TAGS = "stress_ng,redis_rpc_perf,twemcache_rpc_perf,twemcache_mutilate,specjbb"
             }
             failFast true
             parallel {
+                stage('WCA Daemonset E2E for Kubernetes') {
+                    when {expression{return params.E2E_K8S_DS}}
+                    agent { label 'Daemonset' }
+                    environment {
+                        PROMETHEUS = 'http://100.64.176.18:30900'
+                        KUBERNETES_HOST='100.64.176.32'
+                        KUBECONFIG="${HOME}/.kube/admin.conf"
+                        KUSTOMIZATION_MONITORING='examples/kubernetes/monitoring/'
+                        KUSTOMIZATION_WORKLOAD='examples/kubernetes/workloads/'
+                    }
+                    steps {
+                        kustomize_wca_and_workloads_check()
+                    }
+                    post {
+                        always {
+                            print('Cleaning workloads and wca...')
+                            sh "kubectl delete -k ${WORKSPACE}/${KUSTOMIZATION_WORKLOAD} --wait=false"
+                            sh "kubectl delete -k ${WORKSPACE}/${KUSTOMIZATION_MONITORING} --wait=false"
+                            junit 'unit_results.xml'
+                        }
+                    }
+                }
                 stage('WCA E2E for Kubernetes') {
+                    when {expression{return params.E2E_K8S}}
                     agent { label 'kubernetes' }
                     environment {
                         KUBERNETES_HOST='100.64.176.17'
@@ -217,6 +333,7 @@ pipeline {
                     }
                 }
                 stage('WCA E2E for Mesos') {
+                    when {expression{return params.E2E_MESOS}}
                     agent { label 'mesos' }
                     environment {
                         MESOS_AGENT='100.64.176.14'
@@ -244,9 +361,18 @@ pipeline {
 /* Helper function */
 /*----------------------------------------------------------------------------------------------------------*/
 def wca_and_workloads_check() {
-    images_check()
+    print('-wca_and_workloads_check-')
+    sh "echo GIT_COMMIT=$GIT_COMMIT"
+    // stress_ng,redis_rpc_perf,twemcache_rpc_perf,twemcache_mutilate,specjbb
+    image_check("wca")
+    image_check("wca/stress_ng")
+    image_check("wca/rpc_perf")
+    image_check("wca/redis")
+    image_check("wca/twemcache")
+    image_check("wca/mutilate")
+    image_check("wca/specjbb")
     sh "make venv"
-    sh "make wca_package_in_docker"
+    sh "make wca_package_in_docker_with_kafka"
     print('Reconfiguring wca...')
     copy_files("${WORKSPACE}/tests/e2e/demo_scenarios/common/${CONFIG}", "${WORKSPACE}/tests/e2e/demo_scenarios/common/wca_config.yml.tmp")
     replace_in_config(CERT)
@@ -255,23 +381,109 @@ def wca_and_workloads_check() {
     copy_files("${WORKSPACE}/dist/wca.pex", "/usr/bin/wca.pex", true)
     copy_files("${WORKSPACE}/tests/e2e/demo_scenarios/common/wca.service", "/etc/systemd/system/wca.service", true)
     sh "sudo systemctl daemon-reload"
+    print('Start wca...')
     start_wca()
     copy_files("${WORKSPACE}/${HOST_INVENTORY}", "${WORKSPACE}/${INVENTORY}")
     replace_commit()
+    print('Run workloads...')
     run_workloads("${EXTRA_ANSIBLE_PARAMS}", "${LABELS}")
+    print('Sleeping...')
     sleep RUN_WORKLOADS_SLEEP_TIME
+    print('Test E2E metrics...')
     test_wca_metrics()
 }
 
-def images_check() {
-    print('Check if docker images build for this PR')
-    /* Checking only for rpc_perf */
-    check_image = sh(script: 'curl ${DOCKER_REPOSITORY_URL}/v2/wca/rpc_perf/manifests/${BUILD_COMMIT} | jq .name', returnStdout: true).trim()
+def kustomize_wca_and_workloads_check() {
+    print('-kustomize_wca_and_workloads_check-')
+    image_check("wca")
+    // examaples/kubernetes workloads like: memcached, memtier, redis use official images
+    sh "echo GIT_COMMIT=$GIT_COMMIT"
+    print('Configure wca and workloads...')
+    kustomize_replace_commit_in_wca()
+    kustomize_add_labels("memcached-mutilate")
+    kustomize_add_labels("redis-memtier")
+    kustomize_add_labels("stress")
+    kustomize_add_labels("sysbench-memory")
+
+    print('Configure images...')
+    kustomize_set_docker_image("memcached-mutilate", "mutilate")
+    kustomize_set_docker_image("redis-memtier", "memtier_benchmark")
+    kustomize_set_docker_image("stress", "stress_ng")
+    kustomize_set_docker_image("sysbench-memory", "sysbench")
+
+    print('Starting wca...')
+    sh "kubectl apply -k ${WORKSPACE}/${KUSTOMIZATION_MONITORING}"
+
+    print('Deploy workloads...')
+    sh "kubectl apply -k ${WORKSPACE}/${KUSTOMIZATION_WORKLOAD}"
+
+    print('Scale up workloads...')
+    def list = ["stress-stream-small", "redis-small", "memtier-small", "sysbench-memory-small", "memcached-small", "mutilate-small"]
+    for(item in list){
+        sh "kubectl scale --replicas=1 statefulset $item"
+    }
+
+    print('Sleep while workloads are running...')
+    sleep RUN_WORKLOADS_SLEEP_TIME
+    print('Test kustomize metrics...')
+    test_wca_metrics_kustomize()
+}
+
+def kustomize_set_docker_image(workload, workload_image) {
+    file = "${WORKSPACE}/examples/kubernetes/workloads/${workload}/kustomization.yaml"
+    testing_image = "\nimages:\n" +
+    "  - name: ${workload_image}\n" +
+    "    newName: ${DOCKER_REPOSITORY_URL}/wca/${workload_image}\n" +
+    "    newTag: ${GIT_COMMIT}\n"
+    sh "echo '${testing_image}' >> ${file}"
+
+    image_check("wca/${workload_image}")
+}
+
+def kustomize_replace_commit_in_wca() {
+    contentReplace(
+        configs: [
+            fileContentReplaceConfig(
+                configs: [
+                    fileContentReplaceItemConfig( search: 'master', replace: "${GIT_COMMIT}", matchCount: 0),
+                ],
+                fileEncoding: 'UTF-8',
+                filePath: "${WORKSPACE}/examples/kubernetes/monitoring/wca/kustomization.yaml")])
+}
+
+def kustomize_add_labels(workload) {
+    contentReplace(
+        configs: [
+            fileContentReplaceConfig(
+                configs: [
+                    fileContentReplaceItemConfig( search: 'commonLabels:', replace:
+                    "commonLabels:\n" +
+                        "  build_commit: '${GIT_COMMIT}'\n" +
+                        "  build_number: '${BUILD_NUMBER}'\n" +
+                        "  node_name: '${NODE_NAME}'\n" +
+                        "  workload_name: '${workload}'\n" +
+                        "  env_uniq_id: '32'\n",
+                    matchCount: 0),
+                ],
+                fileEncoding: 'UTF-8',
+                filePath: "${WORKSPACE}/examples/kubernetes/workloads/${workload}/kustomization.yaml")])
+}
+
+def test_wca_metrics_kustomize() {
+    sh "make venv; PYTHONPATH=. pipenv run pytest ${WORKSPACE}/tests/e2e/test_wca_metrics.py::test_wca_metrics_kustomize --junitxml=unit_results.xml --log-level=debug --log-cli-level=debug -v"
+}
+
+def image_check(image_name) {
+    print("Check if workload (${image_name}) docker image build for this PR ${GIT_COMMIT}")
+    check_image = sh(script: "curl -s ${DOCKER_REPOSITORY_URL}/v2/${image_name}/manifests/${GIT_COMMIT} | jq -r .name", returnStdout: true).trim()
     if (check_image == 'null') {
-        print('Docker images are not available!')
+        print("Workload '${image_name}' docker image is not available!")
         sh "exit 1"
+    } else {
+        print("Found '${image_name}' image - curl output: ${check_image}")
     }
 }
+
 
 def clean() {
     print('Cleaning: stopping WCA and workloads .')
@@ -351,7 +563,7 @@ def run_workloads(extra_params, labels) {
 def stop_workloads(extra_params) {
     print('Stopping all workloads...')
     sh "ansible-playbook  ${extra_params}  -i ${WORKSPACE}/${INVENTORY} --tags=clean_jobs ${WORKSPACE}/${PLAYBOOK}"
-    sleep 5 
+    sleep 5
 }
 
 def remove_file(path) {
@@ -382,4 +594,14 @@ def if_perform_e2e() {
         print(result)
         return result == ""
     }
+}
+
+def generate_docs() {
+    sh '''cp docs/metrics.rst docs/metrics.tmp.rst
+          cp docs/metrics.csv docs/metrics.tmp.csv
+          make generate_docs
+          diff docs/metrics.csv docs/metrics.tmp.csv
+          diff docs/metrics.rst docs/metrics.tmp.rst
+          rm docs/metrics.tmp.rst
+          rm docs/metrics.tmp.csv'''
 }

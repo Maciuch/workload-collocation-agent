@@ -1,6 +1,8 @@
 runner: !AllocationRunner
-  node: !StaticNode
-    tasks:
-      - task1
+  measurement_runner: !MeasurementRunner
+    node: !StaticNode
+      tasks:
+        - task1
+
   allocator: !StaticAllocator
     config: configs/extra/static_allocator_config.yaml
